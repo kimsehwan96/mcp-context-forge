@@ -55,7 +55,8 @@ Examples:
 import asyncio
 from base64 import b64decode
 import binascii
-from typing import Any, Optional
+from time import monotonic
+from typing import Any, Dict, List, Optional, Tuple
 
 # Third-Party
 from fastapi import Cookie, Depends, HTTPException, Request, status
@@ -1215,3 +1216,234 @@ async def require_admin_auth(
         else:
             # Re-raise the basic auth error
             raise
+
+
+# ---------------------------------------------------------------------------
+# External OAuth token verification (OIDC / JWKS)
+# ---------------------------------------------------------------------------
+
+# Supported asymmetric signing algorithms for external tokens.
+# HS256 is intentionally excluded — external tokens must use asymmetric signatures.
+_EXTERNAL_TOKEN_ALGORITHMS: List[str] = [
+    "RS256", "RS384", "RS512",
+    "ES256", "ES384", "ES512",
+    "PS256", "PS384", "PS512",
+    "EdDSA",
+]
+
+# OIDC discovery metadata cache: {normalized_issuer: (cached_at_monotonic, metadata_dict)}
+_oidc_metadata_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+_OIDC_METADATA_CACHE_TTL_SECONDS = 300
+
+# PyJWKClient cache: {jwks_uri: PyJWKClient}
+_jwks_client_cache: Dict[str, jwt.PyJWKClient] = {}
+
+
+async def _get_oidc_provider_metadata(issuer: str) -> Optional[Dict[str, Any]]:
+    """Discover and cache OIDC provider metadata via well-known endpoint.
+
+    Args:
+        issuer: OIDC issuer URL (e.g. ``https://auth.example.com/application/o/myapp``).
+
+    Returns:
+        Provider metadata dict from discovery endpoint, or None on failure.
+    """
+    normalized_issuer = issuer.rstrip("/")
+    cached = _oidc_metadata_cache.get(normalized_issuer)
+    if cached is not None:
+        cached_at, cached_metadata = cached
+        if monotonic() - cached_at < _OIDC_METADATA_CACHE_TTL_SECONDS:
+            return cached_metadata
+        _oidc_metadata_cache.pop(normalized_issuer, None)
+
+    # First-Party
+    from mcpgateway.services.http_client_service import get_http_client  # pylint: disable=import-outside-toplevel
+
+    discovery_url = f"{normalized_issuer}/.well-known/openid-configuration"
+    try:
+        client = await get_http_client()
+        response = await client.get(discovery_url, timeout=settings.oauth_request_timeout)
+        if response.status_code != 200:
+            logger.warning("External token OIDC discovery failed for issuer %s with HTTP %s", normalized_issuer, response.status_code)
+            return None
+
+        metadata = response.json()
+        if not isinstance(metadata, dict):
+            logger.warning("External token OIDC discovery response for issuer %s is not a JSON object", normalized_issuer)
+            return None
+        _oidc_metadata_cache[normalized_issuer] = (monotonic(), metadata)
+        return metadata
+    except Exception as exc:
+        logger.warning("External token OIDC discovery request failed for issuer %s: %s", normalized_issuer, exc)
+        return None
+
+
+def _get_jwks_client(jwks_uri: str) -> jwt.PyJWKClient:
+    """Get or create a cached PyJWKClient instance.
+
+    Args:
+        jwks_uri: JWKS endpoint URL.
+
+    Returns:
+        Cached or newly created ``PyJWKClient``.
+    """
+    if jwks_uri not in _jwks_client_cache:
+        _jwks_client_cache[jwks_uri] = jwt.PyJWKClient(jwks_uri)
+    return _jwks_client_cache[jwks_uri]
+
+
+async def _get_server_oauth_config(server_id: str) -> Optional[Tuple[Optional[Dict[str, Any]], bool]]:
+    """Look up a server's OAuth configuration from the database.
+
+    Args:
+        server_id: Virtual-server identifier.
+
+    Returns:
+        Tuple of (oauth_config dict, oauth_enabled bool), or None if lookup fails.
+    """
+    # First-Party
+    from mcpgateway.db import Server as DbServer, fresh_db_session  # pylint: disable=import-outside-toplevel
+
+    try:
+        def _lookup_sync() -> Optional[Tuple[Optional[Dict[str, Any]], bool]]:
+            with fresh_db_session() as db:
+                from sqlalchemy import select  # pylint: disable=import-outside-toplevel
+                server = db.execute(select(DbServer).where(DbServer.id == server_id)).scalar_one_or_none()
+                if server is None:
+                    return None
+                return (server.oauth_config, server.oauth_enabled)
+
+        return await asyncio.to_thread(_lookup_sync)
+    except Exception as exc:
+        logger.warning("External token verification: failed to look up server %s OAuth config: %s", server_id, exc)
+        return None
+
+
+async def verify_external_jwt_token(token: str, server_id: str) -> Optional[Dict[str, Any]]:
+    """Verify an external OAuth token against the server's configured authorization servers.
+
+    Decodes the JWT header (unverified) to extract the issuer, validates it against
+    the server's ``oauth_config.authorization_servers`` allowlist, resolves the JWKS
+    URI via OIDC discovery, and verifies the token signature and claims.
+
+    Args:
+        token: Raw JWT Bearer token string.
+        server_id: Virtual-server identifier to look up OAuth configuration.
+
+    Returns:
+        Verified claims dict when validation succeeds, otherwise None.
+    """
+    # Look up server OAuth configuration
+    server_oauth_config = await _get_server_oauth_config(server_id)
+    if server_oauth_config is None:
+        return None
+
+    oauth_config, oauth_enabled = server_oauth_config
+    if not oauth_enabled or not oauth_config:
+        logger.debug("External token verification skipped: server %s has no OAuth config or OAuth disabled", server_id)
+        return None
+
+    # Extract allowed issuers from configuration
+    authorization_servers = oauth_config.get("authorization_servers", [])
+    if not authorization_servers:
+        # Fallback to singular form for backward compatibility
+        auth_server = oauth_config.get("authorization_server")
+        if isinstance(auth_server, str) and auth_server.strip():
+            authorization_servers = [auth_server.strip()]
+
+    if not authorization_servers:
+        logger.debug("External token verification skipped: server %s has no authorization_servers configured", server_id)
+        return None
+
+    client_id = oauth_config.get("client_id")
+
+    # Decode JWT header without verification to extract issuer
+    try:
+        unverified_claims = jwt.decode(token, options={"verify_signature": False})
+    except jwt.DecodeError:
+        logger.debug("External token verification failed: unable to decode JWT for server %s", server_id)
+        return None
+
+    token_issuer = unverified_claims.get("iss")
+    if not token_issuer:
+        logger.debug("External token verification failed: no 'iss' claim in token for server %s", server_id)
+        return None
+
+    # SECURITY: Validate issuer is in the allowlist (normalize trailing slashes)
+    normalized_token_issuer = token_issuer.rstrip("/")
+    normalized_allowed = [s.rstrip("/") for s in authorization_servers if isinstance(s, str)]
+    if normalized_token_issuer not in normalized_allowed:
+        logger.warning(
+            "External token verification failed: issuer %s not in allowed list %s for server %s",
+            normalized_token_issuer,
+            normalized_allowed,
+            server_id,
+        )
+        return None
+
+    # Resolve JWKS URI via OIDC discovery
+    metadata = await _get_oidc_provider_metadata(normalized_token_issuer)
+    if not metadata:
+        logger.warning("External token verification failed: OIDC discovery failed for issuer %s (server %s)", normalized_token_issuer, server_id)
+        return None
+
+    jwks_uri = metadata.get("jwks_uri")
+    if not isinstance(jwks_uri, str) or not jwks_uri.strip():
+        logger.warning("External token verification failed: no jwks_uri in OIDC metadata for issuer %s (server %s)", normalized_token_issuer, server_id)
+        return None
+
+    # Issuer already validated against the allowlist with trailing-slash normalization.
+    # PyJWT's verify_iss uses exact string match which breaks on slash differences,
+    # so we disable it and rely on our own normalized check above.
+    discovered_issuer = metadata.get("issuer")
+
+    # Verify token signature and claims using JWKS
+    try:
+        jwks_client = _get_jwks_client(jwks_uri.strip())
+        signing_key = await asyncio.to_thread(jwks_client.get_signing_key_from_jwt, token)
+
+        decode_kwargs: Dict[str, Any] = {
+            "key": signing_key.key,
+            "algorithms": _EXTERNAL_TOKEN_ALGORITHMS,
+            "options": {
+                "verify_signature": True,
+                "verify_exp": True,
+                "verify_iat": True,
+                "verify_iss": False,
+            },
+        }
+
+        # Validate audience against client_id if configured
+        if client_id:
+            decode_kwargs["audience"] = client_id
+            decode_kwargs["options"]["verify_aud"] = True
+        else:
+            decode_kwargs["options"]["verify_aud"] = False
+
+        verified_claims = jwt.decode(token, **decode_kwargs)
+        logger.info(
+            "External token verified successfully for server %s (issuer=%s, sub=%s)",
+            server_id,
+            normalized_token_issuer,
+            verified_claims.get("sub", "unknown"),
+        )
+        return verified_claims
+
+    except jwt.ExpiredSignatureError:
+        logger.warning("External token verification failed: token expired for server %s (issuer=%s)", server_id, normalized_token_issuer)
+        return None
+    except jwt.InvalidAudienceError:
+        logger.warning("External token verification failed: invalid audience for server %s (issuer=%s)", server_id, normalized_token_issuer)
+        return None
+    except jwt.InvalidIssuerError:
+        logger.warning("External token verification failed: invalid issuer for server %s (issuer=%s)", server_id, normalized_token_issuer)
+        return None
+    except jwt.PyJWKClientError as exc:
+        logger.warning("External token verification failed: JWKS client error for server %s (issuer=%s): %s", server_id, normalized_token_issuer, exc)
+        return None
+    except jwt.InvalidTokenError as exc:
+        logger.warning("External token verification failed: invalid token for server %s (issuer=%s): %s", server_id, normalized_token_issuer, exc)
+        return None
+    except Exception as exc:
+        logger.warning("External token verification failed: unexpected error for server %s (issuer=%s): %s", server_id, normalized_token_issuer, exc)
+        return None

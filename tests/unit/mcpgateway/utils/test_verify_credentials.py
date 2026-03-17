@@ -886,7 +886,7 @@ async def test_verify_jwt_token_require_jti_disabled_accepts_missing_jti(monkeyp
     # Token without JTI claim (explicitly exclude JTI to test the warning)
     token = _token({"sub": "user-no-jti-allowed"}, include_jti=False)
 
-    with caplog.at_level(logging.WARNING, logger="mcpgateway.utils.verify_credentials"):
+    with caplog.at_level(logging.WARNING):
         payload = await vc.verify_jwt_token(token)
 
     assert payload["sub"] == "user-no-jti-allowed"
@@ -1895,3 +1895,384 @@ async def test_require_admin_auth_non_admin_jwt_gets_403_not_basic_fallback(monk
     # Must be 403 Forbidden, NOT 200/success from basic auth fallback
     assert exc.value.status_code == status.HTTP_403_FORBIDDEN
     assert "Admin privileges required" in exc.value.detail
+
+
+# ---------------------------------------------------------------------------
+# External OAuth token verification (OIDC / JWKS)
+# ---------------------------------------------------------------------------
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.hazmat.primitives import serialization
+
+_TEST_RSA_PRIVATE_KEY = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+_TEST_RSA_PUBLIC_KEY = _TEST_RSA_PRIVATE_KEY.public_key()
+_TEST_RSA_PRIVATE_PEM = _TEST_RSA_PRIVATE_KEY.private_bytes(
+    encoding=serialization.Encoding.PEM,
+    format=serialization.PrivateFormat.PKCS8,
+    encryption_algorithm=serialization.NoEncryption(),
+)
+_TEST_RSA_PUBLIC_PEM = _TEST_RSA_PUBLIC_KEY.public_bytes(
+    encoding=serialization.Encoding.PEM,
+    format=serialization.PublicFormat.SubjectPublicKeyInfo,
+)
+
+_EXTERNAL_ISSUER = "https://auth.example.com/application/o/myapp"
+_EXTERNAL_SERVER_ID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+
+
+def _external_token(
+    claims: dict,
+    *,
+    exp_delta: int = 60,
+    algorithm: str = "RS256",
+    private_key=None,
+) -> str:
+    """Return an RSA-signed JWT for external OAuth tests."""
+    payload = claims.copy()
+    if exp_delta is not None:
+        expire = datetime.now(timezone.utc) + timedelta(minutes=exp_delta)
+        payload["exp"] = int(expire.timestamp())
+    payload.setdefault("iat", int(datetime.now(timezone.utc).timestamp()))
+    key = private_key or _TEST_RSA_PRIVATE_PEM
+    return jwt.encode(payload, key, algorithm=algorithm)
+
+
+def _clear_external_oauth_caches():
+    """Clear module-level caches for test isolation."""
+    vc._oidc_metadata_cache.clear()
+    vc._jwks_client_cache.clear()
+
+
+@pytest.mark.asyncio
+async def test_verify_external_jwt_token_server_not_found(monkeypatch):
+    """_get_server_oauth_config returns None -> verify returns None."""
+    _clear_external_oauth_caches()
+    monkeypatch.setattr(vc, "_get_server_oauth_config", AsyncMock(return_value=None))
+
+    token = _external_token({"sub": "user@example.com", "iss": _EXTERNAL_ISSUER})
+    result = await vc.verify_external_jwt_token(token, _EXTERNAL_SERVER_ID)
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_verify_external_jwt_token_oauth_disabled(monkeypatch):
+    """oauth_enabled=False -> verify returns None."""
+    _clear_external_oauth_caches()
+    monkeypatch.setattr(
+        vc, "_get_server_oauth_config",
+        AsyncMock(return_value=({"authorization_servers": [_EXTERNAL_ISSUER]}, False)),
+    )
+
+    token = _external_token({"sub": "user@example.com", "iss": _EXTERNAL_ISSUER})
+    result = await vc.verify_external_jwt_token(token, _EXTERNAL_SERVER_ID)
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_verify_external_jwt_token_no_authorization_servers(monkeypatch):
+    """Empty oauth_config with no authorization_servers -> returns None."""
+    _clear_external_oauth_caches()
+    monkeypatch.setattr(
+        vc, "_get_server_oauth_config",
+        AsyncMock(return_value=({}, True)),
+    )
+
+    token = _external_token({"sub": "user@example.com", "iss": _EXTERNAL_ISSUER})
+    result = await vc.verify_external_jwt_token(token, _EXTERNAL_SERVER_ID)
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_verify_external_jwt_token_issuer_not_in_allowlist(monkeypatch):
+    """Token issuer doesn't match allowed servers -> returns None."""
+    _clear_external_oauth_caches()
+    monkeypatch.setattr(
+        vc, "_get_server_oauth_config",
+        AsyncMock(return_value=({"authorization_servers": ["https://other-idp.example.com"]}, True)),
+    )
+
+    token = _external_token({"sub": "user@example.com", "iss": _EXTERNAL_ISSUER})
+    result = await vc.verify_external_jwt_token(token, _EXTERNAL_SERVER_ID)
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_verify_external_jwt_token_oidc_discovery_fails(monkeypatch):
+    """OIDC discovery returns None -> returns None."""
+    _clear_external_oauth_caches()
+    monkeypatch.setattr(
+        vc, "_get_server_oauth_config",
+        AsyncMock(return_value=({"authorization_servers": [_EXTERNAL_ISSUER]}, True)),
+    )
+    monkeypatch.setattr(vc, "_get_oidc_provider_metadata", AsyncMock(return_value=None))
+
+    token = _external_token({"sub": "user@example.com", "iss": _EXTERNAL_ISSUER})
+    result = await vc.verify_external_jwt_token(token, _EXTERNAL_SERVER_ID)
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_verify_external_jwt_token_no_jwks_uri(monkeypatch):
+    """OIDC metadata without jwks_uri -> returns None."""
+    _clear_external_oauth_caches()
+    monkeypatch.setattr(
+        vc, "_get_server_oauth_config",
+        AsyncMock(return_value=({"authorization_servers": [_EXTERNAL_ISSUER]}, True)),
+    )
+    monkeypatch.setattr(
+        vc, "_get_oidc_provider_metadata",
+        AsyncMock(return_value={"issuer": _EXTERNAL_ISSUER}),  # no jwks_uri
+    )
+
+    token = _external_token({"sub": "user@example.com", "iss": _EXTERNAL_ISSUER})
+    result = await vc.verify_external_jwt_token(token, _EXTERNAL_SERVER_ID)
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_verify_external_jwt_token_success(monkeypatch):
+    """Happy path: RSA-signed token verified against mocked JWKS."""
+    _clear_external_oauth_caches()
+    monkeypatch.setattr(
+        vc, "_get_server_oauth_config",
+        AsyncMock(return_value=({"authorization_servers": [_EXTERNAL_ISSUER], "client_id": "my-client"}, True)),
+    )
+    monkeypatch.setattr(
+        vc, "_get_oidc_provider_metadata",
+        AsyncMock(return_value={
+            "issuer": _EXTERNAL_ISSUER,
+            "jwks_uri": "https://auth.example.com/application/o/myapp/jwks/",
+        }),
+    )
+
+    mock_signing_key = MagicMock()
+    mock_signing_key.key = _TEST_RSA_PUBLIC_PEM
+    mock_jwks_client = MagicMock()
+    mock_jwks_client.get_signing_key_from_jwt = MagicMock(return_value=mock_signing_key)
+    monkeypatch.setattr(vc, "_get_jwks_client", lambda uri: mock_jwks_client)
+
+    token = _external_token({
+        "sub": "user@example.com",
+        "iss": _EXTERNAL_ISSUER,
+        "aud": "my-client",
+        "email": "user@example.com",
+    })
+    result = await vc.verify_external_jwt_token(token, _EXTERNAL_SERVER_ID)
+    assert result is not None
+    assert result["sub"] == "user@example.com"
+    assert result["email"] == "user@example.com"
+
+
+@pytest.mark.asyncio
+async def test_verify_external_jwt_token_expired(monkeypatch):
+    """Expired token -> returns None."""
+    _clear_external_oauth_caches()
+    monkeypatch.setattr(
+        vc, "_get_server_oauth_config",
+        AsyncMock(return_value=({"authorization_servers": [_EXTERNAL_ISSUER]}, True)),
+    )
+    monkeypatch.setattr(
+        vc, "_get_oidc_provider_metadata",
+        AsyncMock(return_value={
+            "issuer": _EXTERNAL_ISSUER,
+            "jwks_uri": "https://auth.example.com/jwks/",
+        }),
+    )
+
+    mock_signing_key = MagicMock()
+    mock_signing_key.key = _TEST_RSA_PUBLIC_PEM
+    mock_jwks_client = MagicMock()
+    mock_jwks_client.get_signing_key_from_jwt = MagicMock(return_value=mock_signing_key)
+    monkeypatch.setattr(vc, "_get_jwks_client", lambda uri: mock_jwks_client)
+
+    token = _external_token(
+        {"sub": "user@example.com", "iss": _EXTERNAL_ISSUER},
+        exp_delta=-5,  # already expired
+    )
+    result = await vc.verify_external_jwt_token(token, _EXTERNAL_SERVER_ID)
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_verify_external_jwt_token_invalid_audience(monkeypatch):
+    """Wrong audience -> returns None."""
+    _clear_external_oauth_caches()
+    monkeypatch.setattr(
+        vc, "_get_server_oauth_config",
+        AsyncMock(return_value=({"authorization_servers": [_EXTERNAL_ISSUER], "client_id": "expected-client"}, True)),
+    )
+    monkeypatch.setattr(
+        vc, "_get_oidc_provider_metadata",
+        AsyncMock(return_value={
+            "issuer": _EXTERNAL_ISSUER,
+            "jwks_uri": "https://auth.example.com/jwks/",
+        }),
+    )
+
+    mock_signing_key = MagicMock()
+    mock_signing_key.key = _TEST_RSA_PUBLIC_PEM
+    mock_jwks_client = MagicMock()
+    mock_jwks_client.get_signing_key_from_jwt = MagicMock(return_value=mock_signing_key)
+    monkeypatch.setattr(vc, "_get_jwks_client", lambda uri: mock_jwks_client)
+
+    token = _external_token({
+        "sub": "user@example.com",
+        "iss": _EXTERNAL_ISSUER,
+        "aud": "wrong-client",  # audience mismatch
+    })
+    result = await vc.verify_external_jwt_token(token, _EXTERNAL_SERVER_ID)
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_verify_external_jwt_token_garbage_token(monkeypatch):
+    """Non-JWT garbage string -> returns None."""
+    _clear_external_oauth_caches()
+    monkeypatch.setattr(
+        vc, "_get_server_oauth_config",
+        AsyncMock(return_value=({"authorization_servers": [_EXTERNAL_ISSUER]}, True)),
+    )
+
+    result = await vc.verify_external_jwt_token("not-a-jwt-token", _EXTERNAL_SERVER_ID)
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_verify_external_jwt_token_no_iss_claim(monkeypatch):
+    """JWT without iss claim -> returns None."""
+    _clear_external_oauth_caches()
+    monkeypatch.setattr(
+        vc, "_get_server_oauth_config",
+        AsyncMock(return_value=({"authorization_servers": [_EXTERNAL_ISSUER]}, True)),
+    )
+
+    # Encode a token without iss claim
+    token = _external_token({"sub": "user@example.com"})
+    result = await vc.verify_external_jwt_token(token, _EXTERNAL_SERVER_ID)
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_verify_external_jwt_token_trailing_slash_normalization(monkeypatch):
+    """Issuer with trailing slash should match config without trailing slash."""
+    _clear_external_oauth_caches()
+    issuer_with_slash = _EXTERNAL_ISSUER + "/"
+    monkeypatch.setattr(
+        vc, "_get_server_oauth_config",
+        AsyncMock(return_value=({"authorization_servers": [_EXTERNAL_ISSUER]}, True)),  # no slash
+    )
+    monkeypatch.setattr(
+        vc, "_get_oidc_provider_metadata",
+        AsyncMock(return_value={
+            "issuer": _EXTERNAL_ISSUER,
+            "jwks_uri": "https://auth.example.com/jwks/",
+        }),
+    )
+
+    mock_signing_key = MagicMock()
+    mock_signing_key.key = _TEST_RSA_PUBLIC_PEM
+    mock_jwks_client = MagicMock()
+    mock_jwks_client.get_signing_key_from_jwt = MagicMock(return_value=mock_signing_key)
+    monkeypatch.setattr(vc, "_get_jwks_client", lambda uri: mock_jwks_client)
+
+    # Token with trailing slash in issuer
+    token = _external_token({
+        "sub": "user@example.com",
+        "iss": issuer_with_slash,
+    })
+    result = await vc.verify_external_jwt_token(token, _EXTERNAL_SERVER_ID)
+    assert result is not None
+    assert result["sub"] == "user@example.com"
+
+
+# ---------------------------------------------------------------------------
+# _get_oidc_provider_metadata tests
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_get_oidc_provider_metadata_success(monkeypatch):
+    """Successful OIDC discovery returns metadata dict."""
+    _clear_external_oauth_caches()
+
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.json.return_value = {"issuer": _EXTERNAL_ISSUER, "jwks_uri": "https://auth.example.com/jwks/"}
+
+    mock_client = AsyncMock()
+    mock_client.get = AsyncMock(return_value=mock_response)
+
+    async def _mock_get_http_client():
+        return mock_client
+
+    monkeypatch.setattr("mcpgateway.utils.verify_credentials.get_http_client", _mock_get_http_client)
+    monkeypatch.setattr(vc.settings, "oauth_request_timeout", 10, raising=False)
+
+    metadata = await vc._get_oidc_provider_metadata(_EXTERNAL_ISSUER)
+    assert metadata is not None
+    assert metadata["issuer"] == _EXTERNAL_ISSUER
+    assert metadata["jwks_uri"] == "https://auth.example.com/jwks/"
+
+
+@pytest.mark.asyncio
+async def test_get_oidc_provider_metadata_http_error(monkeypatch):
+    """Non-200 HTTP status -> returns None."""
+    _clear_external_oauth_caches()
+
+    mock_response = MagicMock()
+    mock_response.status_code = 404
+
+    mock_client = AsyncMock()
+    mock_client.get = AsyncMock(return_value=mock_response)
+
+    async def _mock_get_http_client():
+        return mock_client
+
+    monkeypatch.setattr("mcpgateway.utils.verify_credentials.get_http_client", _mock_get_http_client)
+    monkeypatch.setattr(vc.settings, "oauth_request_timeout", 10, raising=False)
+
+    metadata = await vc._get_oidc_provider_metadata(_EXTERNAL_ISSUER)
+    assert metadata is None
+
+
+@pytest.mark.asyncio
+async def test_get_oidc_provider_metadata_cache_hit(monkeypatch):
+    """Second call for same issuer should use cache (no HTTP call)."""
+    _clear_external_oauth_caches()
+
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.json.return_value = {"issuer": _EXTERNAL_ISSUER, "jwks_uri": "https://auth.example.com/jwks/"}
+
+    mock_client = AsyncMock()
+    mock_client.get = AsyncMock(return_value=mock_response)
+
+    async def _mock_get_http_client():
+        return mock_client
+
+    monkeypatch.setattr("mcpgateway.utils.verify_credentials.get_http_client", _mock_get_http_client)
+    monkeypatch.setattr(vc.settings, "oauth_request_timeout", 10, raising=False)
+
+    # First call populates cache
+    metadata1 = await vc._get_oidc_provider_metadata(_EXTERNAL_ISSUER)
+    assert metadata1 is not None
+
+    # Second call should use cache - no additional HTTP call
+    metadata2 = await vc._get_oidc_provider_metadata(_EXTERNAL_ISSUER)
+    assert metadata2 == metadata1
+    assert mock_client.get.await_count == 1  # only one HTTP call
+
+
+@pytest.mark.asyncio
+async def test_get_oidc_provider_metadata_request_exception(monkeypatch):
+    """HTTP client throws exception -> returns None."""
+    _clear_external_oauth_caches()
+
+    mock_client = AsyncMock()
+    mock_client.get = AsyncMock(side_effect=ConnectionError("Network unreachable"))
+
+    async def _mock_get_http_client():
+        return mock_client
+
+    monkeypatch.setattr("mcpgateway.utils.verify_credentials.get_http_client", _mock_get_http_client)
+    monkeypatch.setattr(vc.settings, "oauth_request_timeout", 10, raising=False)
+
+    metadata = await vc._get_oidc_provider_metadata(_EXTERNAL_ISSUER)
+    assert metadata is None

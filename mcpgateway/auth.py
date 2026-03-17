@@ -839,6 +839,154 @@ def _user_from_cached_dict(user_dict: Dict[str, Any]) -> EmailUser:
     )
 
 
+def _resolve_or_create_external_user_sync(claims: Dict[str, Any], server_id: str) -> Optional[EmailUser]:
+    """Resolve an existing user or auto-create one from external token claims.
+
+    Extracts email from the ``email`` or ``sub`` claim, looks up the user in the
+    database, and auto-creates with appropriate defaults if not found.
+
+    Args:
+        claims: Verified JWT claims dict from the external token.
+        server_id: Virtual-server identifier (for logging context).
+
+    Returns:
+        EmailUser instance (detached from session) or None on failure.
+    """
+    logger = logging.getLogger(__name__)
+    from sqlalchemy import select  # pylint: disable=import-outside-toplevel
+
+    email = claims.get("email")
+    if not email:
+        # Fall back to sub if it looks like an email
+        sub = claims.get("sub")
+        if isinstance(sub, str) and "@" in sub:
+            email = sub
+
+    if not email or not isinstance(email, str):
+        logger.warning("External token for server %s has no usable email claim (sub=%s)", server_id, claims.get("sub"))
+        return None
+
+    email = email.strip().lower()
+
+    try:
+        with fresh_db_session() as db:
+            result = db.execute(select(EmailUser).where(EmailUser.email == email))
+            user = result.scalar_one_or_none()
+
+            if user is not None:
+                # Return a detached copy
+                return EmailUser(
+                    email=user.email,
+                    password_hash=user.password_hash,
+                    full_name=user.full_name,
+                    is_admin=user.is_admin,
+                    is_active=user.is_active,
+                    auth_provider=user.auth_provider,
+                    password_change_required=user.password_change_required,
+                    email_verified_at=user.email_verified_at,
+                    created_at=user.created_at,
+                    updated_at=user.updated_at,
+                )
+
+            # Auto-create user from external token claims
+            full_name = claims.get("name") or claims.get("preferred_username") or email.split("@")[0]
+            new_user = EmailUser(
+                email=email,
+                password_hash="!external-oauth",  # nosec B106 - Marker, not a real password
+                full_name=full_name,
+                is_admin=False,
+                is_active=True,
+                auth_provider="external_oauth",
+                password_change_required=False,
+                email_verified_at=datetime.now(timezone.utc),
+                created_at=datetime.now(timezone.utc),
+                updated_at=datetime.now(timezone.utc),
+            )
+            db.add(new_user)
+            db.commit()
+
+            logger.info("Auto-created user %s from external OAuth token for server %s", email, server_id)
+
+            # Return a detached copy
+            return EmailUser(
+                email=new_user.email,
+                password_hash=new_user.password_hash,
+                full_name=new_user.full_name,
+                is_admin=new_user.is_admin,
+                is_active=new_user.is_active,
+                auth_provider=new_user.auth_provider,
+                password_change_required=new_user.password_change_required,
+                email_verified_at=new_user.email_verified_at,
+                created_at=new_user.created_at,
+                updated_at=new_user.updated_at,
+            )
+    except Exception as exc:
+        logger.warning("External token user resolution failed for server %s (email=%s): %s", server_id, email, exc)
+        return None
+
+
+async def _resolve_or_create_external_user(claims: Dict[str, Any], server_id: str) -> Optional[EmailUser]:
+    """Async wrapper for user resolution from external token claims.
+
+    Args:
+        claims: Verified JWT claims dict from the external token.
+        server_id: Virtual-server identifier (for logging context).
+
+    Returns:
+        EmailUser instance (detached from session) or None on failure.
+    """
+    return await asyncio.to_thread(_resolve_or_create_external_user_sync, claims, server_id)
+
+
+async def _try_external_token_auth_sse(request: Optional[Request], token: str) -> Optional[EmailUser]:
+    """Attempt external OAuth token verification for SSE/REST endpoints.
+
+    When the standard JWT verification fails, this function checks whether the
+    token was issued by an external Authorization Server configured on the
+    target virtual server (OIDC/PKCE flow).
+
+    Args:
+        request: The incoming HTTP request (used to extract server_id from path).
+        token: Raw Bearer token string.
+
+    Returns:
+        EmailUser instance if external verification succeeds, None otherwise.
+    """
+    logger = logging.getLogger(__name__)
+    if request is None:
+        return None
+
+    import re  # pylint: disable=import-outside-toplevel
+
+    path = request.url.path if request.url else ""
+    match = re.search(r"/servers/(?P<server_id>[a-fA-F0-9\-]+)/", path)
+    if not match:
+        return None
+
+    server_id = match.group("server_id")
+
+    try:
+        # First-Party
+        from mcpgateway.utils.verify_credentials import verify_external_jwt_token  # pylint: disable=import-outside-toplevel
+
+        claims = await verify_external_jwt_token(token, server_id)
+        if claims is None:
+            return None
+
+        user = await _resolve_or_create_external_user(claims, server_id)
+        if user is None:
+            return None
+
+        if not getattr(user, "is_active", True):
+            return None
+
+        logger.info("External OAuth authentication succeeded for user %s on server %s", user.email, server_id)
+        return user
+    except Exception:
+        logger.debug("External token auth fallback failed for server %s", server_id, exc_info=True)
+        return None
+
+
 async def get_current_user(
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
     request: Request = None,  # type: ignore[assignment]
@@ -1331,6 +1479,10 @@ async def get_current_user(
 
     except HTTPException:
         # Re-raise HTTPException from verify_jwt_token (handles expired/invalid tokens)
+        # But first try external OAuth token verification as fallback
+        ext_user = await _try_external_token_auth_sse(request, credentials.credentials)
+        if ext_user is not None:
+            return ext_user
         raise
     except Exception as jwt_error:
         # JWT validation failed, try database API token

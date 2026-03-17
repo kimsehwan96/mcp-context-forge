@@ -3291,3 +3291,86 @@ def test_resolve_plugin_authenticated_user_sync_returns_none_for_missing_email()
 
     assert auth_module._resolve_plugin_authenticated_user_sync({}) is None
     assert auth_module._resolve_plugin_authenticated_user_sync({"email": "   "}) is None
+
+
+# ---------------------------------------------------------------------------
+# External OAuth user resolution tests
+# ---------------------------------------------------------------------------
+
+
+class TestResolveOrCreateExternalUser:
+    """Tests for _resolve_or_create_external_user_sync / async."""
+
+    @pytest.mark.asyncio
+    async def test_resolve_or_create_external_user_existing(self):
+        """Finds existing user by email claim."""
+        from mcpgateway.auth import _resolve_or_create_external_user
+
+        mock_user = EmailUser(
+            email="existing@example.com",
+            password_hash="hash",
+            full_name="Existing User",
+            is_admin=False,
+            is_active=True,
+            email_verified_at=datetime.now(timezone.utc),
+            created_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(timezone.utc),
+        )
+
+        mock_result = MagicMock()
+        mock_result.scalar_one_or_none.return_value = mock_user
+
+        mock_db = MagicMock()
+        mock_db.execute.return_value = mock_result
+        mock_db.__enter__ = MagicMock(return_value=mock_db)
+        mock_db.__exit__ = MagicMock(return_value=False)
+
+        with patch("mcpgateway.auth.fresh_db_session", return_value=mock_db):
+            user = await _resolve_or_create_external_user(
+                {"email": "existing@example.com", "sub": "existing@example.com"},
+                "server-123",
+            )
+
+        assert user is not None
+        assert user.email == "existing@example.com"
+
+    @pytest.mark.asyncio
+    async def test_resolve_or_create_external_user_creates_new(self):
+        """Auto-creates user when not found in DB."""
+        from mcpgateway.auth import _resolve_or_create_external_user
+
+        mock_result = MagicMock()
+        mock_result.scalar_one_or_none.return_value = None  # user not found
+
+        mock_db = MagicMock()
+        mock_db.execute.return_value = mock_result
+        mock_db.add = MagicMock()
+        mock_db.commit = MagicMock()
+        mock_db.__enter__ = MagicMock(return_value=mock_db)
+        mock_db.__exit__ = MagicMock(return_value=False)
+
+        with patch("mcpgateway.auth.fresh_db_session", return_value=mock_db):
+            user = await _resolve_or_create_external_user(
+                {"email": "new@example.com", "name": "New User"},
+                "server-123",
+            )
+
+        assert user is not None
+        assert user.email == "new@example.com"
+        assert user.full_name == "New User"
+        assert user.auth_provider == "external_oauth"
+        assert user.is_admin is False
+        mock_db.add.assert_called_once()
+        mock_db.commit.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_resolve_or_create_external_user_no_email(self):
+        """No email claim and sub is not email-like -> returns None."""
+        from mcpgateway.auth import _resolve_or_create_external_user
+
+        user = await _resolve_or_create_external_user(
+            {"sub": "user-id-no-email"},
+            "server-123",
+        )
+
+        assert user is None
