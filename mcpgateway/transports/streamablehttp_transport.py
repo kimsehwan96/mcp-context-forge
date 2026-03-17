@@ -2859,6 +2859,56 @@ class _StreamableHttpAuthHandler:
 
         return await self._auth_jwt(token=token)
 
+    async def _try_external_token_auth(self, token: str) -> bool:
+        """Attempt external OAuth token verification as a fallback.
+
+        When the standard JWT verification fails, this method checks whether the
+        token was issued by an external Authorization Server configured on the
+        target virtual server (OIDC/PKCE flow).
+
+        Args:
+            token: Raw Bearer token string.
+
+        Returns:
+            True if external token verification succeeds and user context is set,
+            False otherwise (caller should return 401).
+        """
+        path = self.scope.get("path", "")
+        match = _SERVER_ID_RE.search(path)
+        if not match:
+            return False
+
+        server_id = match.group("server_id")
+
+        try:
+            # First-Party
+            from mcpgateway.utils.verify_credentials import verify_external_jwt_token  # pylint: disable=import-outside-toplevel
+            from mcpgateway.auth import _resolve_or_create_external_user  # pylint: disable=import-outside-toplevel
+
+            claims = await verify_external_jwt_token(token, server_id)
+            if claims is None:
+                return False
+
+            user = await _resolve_or_create_external_user(claims, server_id)
+            if user is None:
+                return False
+
+            if not getattr(user, "is_active", True):
+                return False
+
+            user_context_var.set({
+                "email": user.email,
+                "teams": [],
+                "is_authenticated": True,
+                "is_admin": getattr(user, "is_admin", False),
+                "token_use": "external_oauth",
+            })
+            logger.info("MCP external OAuth authentication succeeded for user %s on server %s", user.email, server_id)
+            return True
+        except Exception:
+            logger.debug("External token auth fallback failed for server %s", server_id, exc_info=True)
+            return False
+
     async def _auth_no_token(self, *, path: str, bearer_header_supplied: bool) -> bool:
         """Handle unauthenticated MCP requests (no Bearer token present).
 
@@ -3039,6 +3089,9 @@ class _StreamableHttpAuthHandler:
             user_context_var.set(auth_user_ctx)
         except HTTPException:
             # JWT verification failed (expired, malformed, bad signature, etc.)
+            # Try external OAuth token verification before returning 401
+            if await self._try_external_token_auth(token):
+                return True
             return await self._send_error(detail="Invalid authentication credentials", headers={"WWW-Authenticate": "Bearer"})
         except SQLAlchemyError:
             # DB failure during team resolution or membership validation
