@@ -3117,9 +3117,9 @@ class _StreamableHttpAuthHandler:
     async def _auth_jwt(self, *, token: str) -> bool:
         """Verify a JWT Bearer token and populate the user context.
 
-        Routes to internal (ContextForge-issued) or external (IdP-issued via
-        OIDC/JWKS) verification based on the token's ``iss`` claim. External
-        tokens are only accepted for virtual servers with ``oauth_enabled=True``.
+        Routes to ContextForge-issued or IdP-issued (OAuth) verification based
+        on the token's ``iss`` claim. IdP-issued tokens are only accepted for
+        virtual servers with ``oauth_enabled=True``.
 
         Args:
             token: Bearer token value extracted from the Authorization header.
@@ -3127,7 +3127,9 @@ class _StreamableHttpAuthHandler:
         Returns:
             True if verification succeeds, False if rejected (401/403/503 sent).
         """
-        # Peek at the token issuer to decide verification path (internal vs external).
+        # Peek at the token issuer to decide verification path.
+        # ContextForge-issued tokens (SSO session, API tokens) have iss == settings.jwt_issuer.
+        # IdP-issued tokens (OAuth access tokens from e.g. Keycloak, Authentik) have the IdP's issuer.
         # Third-Party
         import jwt  # pylint: disable=import-outside-toplevel
 
@@ -3138,7 +3140,7 @@ class _StreamableHttpAuthHandler:
 
         token_issuer = unverified.get("iss", "")
         if token_issuer != settings.jwt_issuer:
-            # External token — delegate to OAuth access token verification
+            # IdP-issued token — delegate to OAuth access token verification
             oauth_result = await self._try_oauth_access_token(token)
             if oauth_result is True:
                 return True
@@ -3501,14 +3503,16 @@ class _StreamableHttpAuthHandler:
         is_admin = bool(user_record.is_admin)
         final_teams = None if is_admin else await asyncio.to_thread(_resolve_teams_from_db_sync, user_email, is_admin=False)
 
-        user_context_var.set({
-            "email": user_email,
-            "teams": final_teams,
-            "is_authenticated": True,
-            "is_admin": is_admin,
-            "permission_is_admin": is_admin,
-            "token_use": "oauth_access_token",
-        })
+        user_context_var.set(
+            {
+                "email": user_email,
+                "teams": final_teams,
+                "is_authenticated": True,
+                "is_admin": is_admin,
+                "permission_is_admin": is_admin,
+                "token_use": "oauth_access_token",
+            }
+        )
         _oauth_checked_var.set(True)
         return True
 

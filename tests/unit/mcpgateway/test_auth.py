@@ -1069,11 +1069,9 @@ class TestUpdateApiTokenLastUsed:
         import sys
 
         # First-Party
+        from mcpgateway import auth
         from mcpgateway.auth import _update_api_token_last_used_sync
         from mcpgateway.db import EmailApiToken
-
-        # First-Party
-        from mcpgateway import auth
 
         # Clear the module-level in-memory cache
         auth._LAST_USED_CACHE.clear()
@@ -1119,11 +1117,9 @@ class TestUpdateApiTokenLastUsed:
     def test_update_api_token_last_used_sync_redis_exception_falls_back_to_memory(self):
         """Test that _update_api_token_last_used_sync falls back to memory cache when Redis operations fail."""
         # First-Party
+        from mcpgateway import auth
         from mcpgateway.auth import _update_api_token_last_used_sync
         from mcpgateway.db import EmailApiToken
-
-        # First-Party
-        from mcpgateway import auth
 
         # Clear the module-level in-memory cache
         auth._LAST_USED_CACHE.clear()
@@ -3347,6 +3343,7 @@ class TestVerifyOauthAccessToken:
         mock_http = AsyncMock()
         mock_http.get.return_value = mock_resp
 
+        # Standard
         from contextlib import ExitStack  # pylint: disable=import-outside-toplevel
 
         stack = ExitStack()
